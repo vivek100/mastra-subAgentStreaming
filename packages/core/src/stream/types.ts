@@ -17,9 +17,21 @@ export enum ChunkFrom {
   WORKFLOW = 'WORKFLOW',
 }
 
+// Optional nested streaming context for sub-agent events
+export interface SubAgentStreamContext {
+  depth?: number;
+  parentRunId?: string;
+  parentAgentName?: string;
+  parentToolName?: string;
+  toolCallPrefix?: string;
+  metadata?: Record<string, any>;
+}
+
 interface BaseChunkType {
   runId: string;
   from: ChunkFrom;
+  // Optional context to support nested/sub-agent streaming without breaking existing behavior
+  context?: SubAgentStreamContext;
 }
 
 interface ResponseMetadataPayload {
@@ -96,6 +108,33 @@ interface ToolResultPayload {
   providerExecuted?: boolean;
   providerMetadata?: SharedV2ProviderMetadata;
   args?: Record<string, any>;
+}
+
+// Sub-agent streaming payloads (opt-in)
+interface SubAgentStartPayload {
+  agentName: string;
+}
+
+interface SubAgentEndPayload {
+  finalResult?: any;
+}
+
+interface SubToolCallPayload {
+  toolCallId?: string;
+  toolName: string;
+  args?: Record<string, any>;
+}
+
+interface SubToolResultPayload {
+  toolCallId?: string;
+  toolName: string;
+  result: any;
+  isError?: boolean;
+}
+
+interface SubTextPayload {
+  id?: string;
+  text: string;
 }
 
 interface ToolCallInputStreamingStartPayload {
@@ -263,7 +302,13 @@ export type ChunkType<TObjectSchema = unknown> =
   | (BaseChunkType & { type: 'tool-output'; payload: ToolOutputPayload })
   | (BaseChunkType & { type: 'step-output'; payload: StepOutputPayload })
   | (BaseChunkType & { type: 'watch'; payload: WatchPayload })
-  | (BaseChunkType & { type: 'tripwire'; payload: TripwirePayload });
+  | (BaseChunkType & { type: 'tripwire'; payload: TripwirePayload })
+  // Optional sub-agent streaming events (only emitted when explicitly enabled)
+  | (BaseChunkType & { type: 'sub-agent-start'; payload: SubAgentStartPayload })
+  | (BaseChunkType & { type: 'sub-agent-end'; payload: SubAgentEndPayload })
+  | (BaseChunkType & { type: 'sub-tool-call'; payload: SubToolCallPayload })
+  | (BaseChunkType & { type: 'sub-tool-result'; payload: SubToolResultPayload })
+  | (BaseChunkType & { type: 'sub-text'; payload: SubTextPayload });
 
 export type OnResult = (result: {
   warnings: Record<string, any>;
