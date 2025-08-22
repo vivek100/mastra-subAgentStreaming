@@ -1,4 +1,6 @@
 import type { ToolCallOptions } from '@ai-sdk/provider-utils-v5';
+import type { WritableStream } from 'stream/web';
+
 import {
   OpenAIReasoningSchemaCompatLayer,
   OpenAISchemaCompatLayer,
@@ -17,8 +19,9 @@ import { RuntimeContext } from '../../runtime-context';
 import { isVercelTool } from '../../tools/toolchecks';
 import type { ToolOptions } from '../../utils';
 import { ToolStream } from '../stream';
-import type { CoreTool, ToolAction, VercelTool, VercelToolV5 } from '../types';
+import type { CoreTool, ToolAction, VercelTool, VercelToolV5, SubAgentStreamingConfig } from '../types';
 import { validateToolInput } from '../validation';
+import { ChunkFrom } from '../../stream/types';
 
 export type ToolToConvert = VercelTool | ToolAction<any, any, any> | VercelToolV5;
 export type LogType = 'tool' | 'toolset' | 'client-tool';
@@ -124,25 +127,238 @@ export class CoreToolBuilder extends MastraBase {
         return tool?.execute?.(args, execOptions as ToolExecutionOptions) ?? undefined;
       }
 
+      // Resolve optional sub-agent streaming config (ToolAction only)
+      let subAgentStreaming: SubAgentStreamingConfig | undefined;
+      const isToolAction = (obj: any): obj is ToolAction => obj && typeof obj === 'object' && 'execute' in obj;
+      if (isToolAction(tool) && 'subAgentStreaming' in tool && tool.subAgentStreaming) {
+        try {
+          subAgentStreaming =
+            typeof tool.subAgentStreaming === 'function'
+              ? (tool.subAgentStreaming as any)({ context: args })
+              : tool.subAgentStreaming;
+        } catch {
+          // ignore invalid config to preserve backwards-compat
+          subAgentStreaming = undefined;
+        }
+      }
+
+      // If not enabled, behave exactly as before
+      const originalWritable = (options.writableStream || (execOptions as any).writableStream) as
+        | WritableStream<import('../../stream/types').ChunkType>
+        | undefined;
+
+      const toolWriter = new ToolStream(
+        {
+          prefix: 'tool',
+          callId: (execOptions as any).toolCallId,
+          name: options.name,
+          runId: options.runId!,
+        },
+        originalWritable,
+      );
+
+      // Early return when no sub-agent streaming config or disabled
+      if (!subAgentStreaming || subAgentStreaming.enabled !== true) {
+        return (
+          tool?.execute?.(
+            {
+              context: args,
+              threadId: options.threadId,
+              resourceId: options.resourceId,
+              mastra: options.mastra,
+              memory: options.memory,
+              runId: options.runId,
+              runtimeContext: options.runtimeContext ?? new RuntimeContext(),
+              writer: toolWriter,
+            },
+            execOptions as ToolExecutionOptions & ToolCallOptions,
+          ) ?? undefined
+        );
+      }
+
+      // Normalized config with defaults and guards
+      const normalizedConfig: SubAgentStreamingConfig = {
+        enabled: true,
+        depth: subAgentStreaming.depth === 2 ? 2 : 1,
+        streamToolCalls: subAgentStreaming.streamToolCalls !== false,
+        streamText: subAgentStreaming.streamText === true,
+        toolCallPrefix: subAgentStreaming.toolCallPrefix,
+        contextMetadata: subAgentStreaming.contextMetadata,
+      };
+
+      // Writer for sub-agent forwarding - writes directly to parent stream using our new sub-* events
+      const subEventWriter = originalWritable
+        ? {
+            write: async (chunk: any) => {
+              const writer = originalWritable.getWriter();
+              try {
+                await writer.write(chunk);
+              } finally {
+                writer.releaseLock();
+              }
+            },
+          }
+        : undefined;
+
+      // Construct a mastra proxy that intercepts getAgent().streamVNext and getAgent().generate to forward chunks
+      const parentAgentName = options.agentName;
+      const parentToolName = options.name;
+      const parentRunId = options.runId!;
+
+      const makeContext = (overrides?: Partial<import('../../stream/types').SubAgentStreamContext>) => ({
+        depth: 1,
+        parentRunId,
+        parentAgentName,
+        parentToolName,
+        toolCallPrefix: normalizedConfig.toolCallPrefix,
+        metadata: normalizedConfig.contextMetadata,
+        ...overrides,
+      });
+
+      const forwardSubAgentStream = async (agent: any, input: any, streamOptions?: any) => {
+        // Only depth 1 supported now; if configured 2, allow sub-agent to create its own nested events (handled elsewhere if added)
+        const subStream = await agent.streamVNext(input, streamOptions);
+
+        // Emit start
+        await subEventWriter?.write?.({
+          type: 'sub-agent-start',
+          runId: parentRunId,
+          from: ChunkFrom.AGENT,
+          payload: { agentName: agent.name, prompt: input },
+          context: makeContext({ depth: 1 }),
+        });
+
+        try {
+          // Iterate over MastraModelOutput.fullStream and forward selected events
+          // We don't have direct iterator on MastraModelOutput; use its fullStream getter
+          const fullStream: ReadableStream<any> = (subStream as any).fullStream;
+          if (!fullStream) {
+            // Fallback: try textStream only
+            if (normalizedConfig.streamText && (subStream as any).textStream) {
+              for await (const t of (subStream as any).textStream as AsyncIterable<string>) {
+                await subEventWriter?.write?.({
+                  type: 'sub-text',
+                  runId: parentRunId,
+                  from: ChunkFrom.AGENT,
+                  payload: { text: t },
+                  context: makeContext({ depth: 1 }),
+                });
+              }
+            }
+          } else {
+            const reader = fullStream.getReader();
+            while (true) {
+              const { done, value } = await reader.read();
+              if (done) break;
+              const chunk = value;
+              if (!chunk || !chunk.type) continue;
+              switch (chunk.type) {
+                case 'tool-call':
+                  if (normalizedConfig.streamToolCalls) {
+                    await subEventWriter?.write?.({
+                      type: 'sub-tool-call',
+                      runId: parentRunId,
+                      from: ChunkFrom.AGENT,
+                      payload: {
+                        toolCallId: chunk.payload?.toolCallId,
+                        toolName: normalizedConfig.toolCallPrefix
+                          ? `${normalizedConfig.toolCallPrefix}.${chunk.payload?.toolName}`
+                          : chunk.payload?.toolName,
+                        args: chunk.payload?.args,
+                      },
+                      context: makeContext({ depth: 1 }),
+                    });
+                  }
+                  break;
+                case 'tool-result':
+                  if (normalizedConfig.streamToolCalls) {
+                    await subEventWriter?.write?.({
+                      type: 'sub-tool-result',
+                      runId: parentRunId,
+                      from: ChunkFrom.AGENT,
+                      payload: {
+                        toolCallId: chunk.payload?.toolCallId,
+                        toolName: normalizedConfig.toolCallPrefix
+                          ? `${normalizedConfig.toolCallPrefix}.${chunk.payload?.toolName}`
+                          : chunk.payload?.toolName,
+                        result: chunk.payload?.result,
+                        isError: chunk.payload?.isError,
+                      },
+                      context: makeContext({ depth: 1 }),
+                    });
+                  }
+                  break;
+                case 'text-delta':
+                  if (normalizedConfig.streamText && chunk.payload?.text) {
+                    await subEventWriter?.write?.({
+                      type: 'sub-text',
+                      runId: parentRunId,
+                      from: ChunkFrom.AGENT,
+                      payload: { text: chunk.payload.text },
+                      context: makeContext({ depth: 1 }),
+                    });
+                  }
+                  break;
+                default:
+                  break;
+              }
+            }
+          }
+        } finally {
+          await subEventWriter?.write?.({
+            type: 'sub-agent-end',
+            runId: parentRunId,
+            from: ChunkFrom.AGENT,
+            payload: { finalResult: await (subStream as any).text?.catch?.(() => undefined) },
+            context: makeContext({ depth: 1 }),
+          });
+        }
+
+        return subStream;
+      };
+
+      // Mastra proxy that overrides getAgent to inject forwarding
+      const injectedMastra = options.mastra
+        ? new Proxy(options.mastra as any, {
+            get(target, prop, receiver) {
+              const value = Reflect.get(target, prop, receiver);
+              if (prop === 'getAgent' && typeof value === 'function') {
+                return new Proxy(value, {
+                  apply(fn, thisArg, argArray) {
+                    const agent = Reflect.apply(fn, thisArg, argArray);
+                    if (agent && typeof agent.streamVNext === 'function') {
+                      return new Proxy(agent, {
+                        get(aTarget, aProp, aReceiver) {
+                          const aValue = Reflect.get(aTarget, aProp, aReceiver);
+                          if (aProp === 'streamVNext' && typeof aValue === 'function') {
+                            return async function (...sArgs: any[]) {
+                              return await forwardSubAgentStream(aTarget, sArgs[0], sArgs[1]);
+                            };
+                          }
+                          return aValue;
+                        },
+                      });
+                    }
+                    return agent;
+                  },
+                });
+              }
+              return value;
+            },
+          })
+        : options.mastra;
+
       return (
         tool?.execute?.(
           {
             context: args,
             threadId: options.threadId,
             resourceId: options.resourceId,
-            mastra: options.mastra,
+            mastra: injectedMastra,
             memory: options.memory,
             runId: options.runId,
             runtimeContext: options.runtimeContext ?? new RuntimeContext(),
-            writer: new ToolStream(
-              {
-                prefix: 'tool',
-                callId: execOptions.toolCallId,
-                name: options.name,
-                runId: options.runId!,
-              },
-              options.writableStream || (execOptions as any).writableStream,
-            ),
+            writer: toolWriter,
           },
           execOptions as ToolExecutionOptions & ToolCallOptions,
         ) ?? undefined

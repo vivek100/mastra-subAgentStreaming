@@ -12,6 +12,15 @@ import type { ToolStream } from './stream';
 export type VercelTool = Tool;
 export type VercelToolV5 = ToolV5;
 
+export interface SubAgentStreamingConfig {
+  enabled: boolean;
+  depth?: 1 | 2;
+  streamToolCalls?: boolean;
+  streamText?: boolean;
+  toolCallPrefix?: string;
+  contextMetadata?: Record<string, any>;
+}
+
 // Define CoreTool as a discriminated union to match the AI SDK's Tool type
 export type CoreTool = {
   id?: string;
@@ -69,6 +78,8 @@ export interface ToolAction<
     options?: ToolExecutionOptions,
   ) => Promise<TSchemaOut extends z.ZodSchema ? z.infer<TSchemaOut> : unknown>;
   mastra?: Mastra;
+  // Opt-in sub-agent streaming configuration (optional and additive)
+  subAgentStreaming?: SubAgentStreamingConfig | ((args: { context: TContext }) => SubAgentStreamingConfig);
   onInputStart?: (options: ToolCallOptions) => void | PromiseLike<void>;
   onInputDelta?: (
     options: {
