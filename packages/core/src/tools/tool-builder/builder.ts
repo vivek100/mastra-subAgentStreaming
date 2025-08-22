@@ -219,45 +219,73 @@ export class CoreToolBuilder extends MastraBase {
         // Only depth 1 supported now; if configured 2, allow sub-agent to create its own nested events (handled elsewhere if added)
         const subStream = await agent.streamVNext(input, streamOptions);
 
-        // Emit start
-        await subEventWriter?.write?.({
-          type: 'sub-agent-start',
-          runId: parentRunId,
-          from: ChunkFrom.AGENT,
-          payload: { agentName: agent.name, prompt: input },
-          context: makeContext({ depth: 1 }),
-        });
+        // Iterate over MastraModelOutput.fullStream to capture runId
+        const fullStream: ReadableStream<any> = (subStream as any).fullStream;
+        let subRunId = parentRunId;
 
-        try {
-          // Iterate over MastraModelOutput.fullStream and forward selected events
-          // We don't have direct iterator on MastraModelOutput; use its fullStream getter
-          const fullStream: ReadableStream<any> = (subStream as any).fullStream;
-          if (!fullStream) {
-            // Fallback: try textStream only
+        if (!fullStream) {
+          // No full stream available; emit start with parent run id
+          await subEventWriter?.write?.({
+            type: 'sub-agent-start',
+            runId: subRunId,
+            from: ChunkFrom.AGENT,
+            payload: { agentName: agent.name, prompt: input },
+            context: makeContext({ depth: 1 }),
+          });
+
+          // Fallback: try textStream only
+          try {
             if (normalizedConfig.streamText && (subStream as any).textStream) {
               for await (const t of (subStream as any).textStream as AsyncIterable<string>) {
                 await subEventWriter?.write?.({
                   type: 'sub-text',
-                  runId: parentRunId,
+                  runId: subRunId,
                   from: ChunkFrom.AGENT,
                   payload: { text: t },
                   context: makeContext({ depth: 1 }),
                 });
               }
             }
-          } else {
-            const reader = fullStream.getReader();
-            while (true) {
-              const { done, value } = await reader.read();
-              if (done) break;
-              const chunk = value;
-              if (!chunk || !chunk.type) continue;
+          } finally {
+            await subEventWriter?.write?.({
+              type: 'sub-agent-end',
+              runId: subRunId,
+              from: ChunkFrom.AGENT,
+              payload: { finalResult: await (subStream as any).text?.catch?.(() => undefined) },
+              context: makeContext({ depth: 1 }),
+            });
+          }
+
+          return subStream;
+        }
+
+        const reader = fullStream.getReader();
+        // Prime the reader to get runId
+        let firstRead = await reader.read();
+        if (!firstRead.done && firstRead.value && firstRead.value.runId) {
+          subRunId = firstRead.value.runId;
+        }
+
+        // Emit start with sub-agent run id
+        await subEventWriter?.write?.({
+          type: 'sub-agent-start',
+          runId: subRunId,
+          from: ChunkFrom.AGENT,
+          payload: { agentName: agent.name, prompt: input },
+          context: makeContext({ depth: 1 }),
+        });
+
+        try {
+          // Process the first chunk if present
+          if (!firstRead.done) {
+            const chunk = firstRead.value;
+            if (chunk && chunk.type) {
               switch (chunk.type) {
                 case 'tool-call':
                   if (normalizedConfig.streamToolCalls) {
                     await subEventWriter?.write?.({
                       type: 'sub-tool-call',
-                      runId: parentRunId,
+                      runId: subRunId,
                       from: ChunkFrom.AGENT,
                       payload: {
                         toolCallId: chunk.payload?.toolCallId,
@@ -274,7 +302,7 @@ export class CoreToolBuilder extends MastraBase {
                   if (normalizedConfig.streamToolCalls) {
                     await subEventWriter?.write?.({
                       type: 'sub-tool-result',
-                      runId: parentRunId,
+                      runId: subRunId,
                       from: ChunkFrom.AGENT,
                       payload: {
                         toolCallId: chunk.payload?.toolCallId,
@@ -292,7 +320,7 @@ export class CoreToolBuilder extends MastraBase {
                   if (normalizedConfig.streamText && chunk.payload?.text) {
                     await subEventWriter?.write?.({
                       type: 'sub-text',
-                      runId: parentRunId,
+                      runId: subRunId,
                       from: ChunkFrom.AGENT,
                       payload: { text: chunk.payload.text },
                       context: makeContext({ depth: 1 }),
@@ -304,10 +332,68 @@ export class CoreToolBuilder extends MastraBase {
               }
             }
           }
+
+          // Continue reading remaining chunks
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            const chunk = value;
+            if (!chunk || !chunk.type) continue;
+            switch (chunk.type) {
+              case 'tool-call':
+                if (normalizedConfig.streamToolCalls) {
+                  await subEventWriter?.write?.({
+                    type: 'sub-tool-call',
+                    runId: subRunId,
+                    from: ChunkFrom.AGENT,
+                    payload: {
+                      toolCallId: chunk.payload?.toolCallId,
+                      toolName: normalizedConfig.toolCallPrefix
+                        ? `${normalizedConfig.toolCallPrefix}.${chunk.payload?.toolName}`
+                        : chunk.payload?.toolName,
+                      args: chunk.payload?.args,
+                    },
+                    context: makeContext({ depth: 1 }),
+                  });
+                }
+                break;
+              case 'tool-result':
+                if (normalizedConfig.streamToolCalls) {
+                  await subEventWriter?.write?.({
+                    type: 'sub-tool-result',
+                    runId: subRunId,
+                    from: ChunkFrom.AGENT,
+                    payload: {
+                      toolCallId: chunk.payload?.toolCallId,
+                      toolName: normalizedConfig.toolCallPrefix
+                        ? `${normalizedConfig.toolCallPrefix}.${chunk.payload?.toolName}`
+                        : chunk.payload?.toolName,
+                      result: chunk.payload?.result,
+                      isError: chunk.payload?.isError,
+                    },
+                    context: makeContext({ depth: 1 }),
+                  });
+                }
+                break;
+              case 'text-delta':
+                if (normalizedConfig.streamText && chunk.payload?.text) {
+                  await subEventWriter?.write?.({
+                    type: 'sub-text',
+                    runId: subRunId,
+                    from: ChunkFrom.AGENT,
+                    payload: { text: chunk.payload.text },
+                    context: makeContext({ depth: 1 }),
+                  });
+                }
+                break;
+              default:
+                break;
+            }
+          }
         } finally {
           await subEventWriter?.write?.({
             type: 'sub-agent-end',
-            runId: parentRunId,
+            runId: subRunId,
             from: ChunkFrom.AGENT,
             payload: { finalResult: await (subStream as any).text?.catch?.(() => undefined) },
             context: makeContext({ depth: 1 }),
